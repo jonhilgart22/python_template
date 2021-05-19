@@ -17,6 +17,23 @@ lint: install
 	poetry run flake8
 	poetry run mypy .
 
+bump_version_patch:
+	bump2version patch
+
+bump_version_minor:
+	bump2version minor
+
+bump_version_major:
+	bump2version major
+
+dist: clean
+	rm setup.py
+	rm -rf dist/*
+	poetry build
+	# extract setup.py from the .whl file that is generated https://github.com/python-poetry/poetry/issues/761
+	tar -xvf dist/*.tar.gz '*/setup.py'
+	find . -name setup.py | xargs  -I  {} cp {} .
+	rm -rf ml-fastapi-server-*
 
 
 
