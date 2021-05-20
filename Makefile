@@ -10,6 +10,7 @@ install:
 	hash poetry || curl -sSL https://raw.githubusercontent.com/python-poetry/poetry/master/get-poetry.py | python
 	poetry run pip install --upgrade pip
 	poetry install --no-root
+	pre-commit install
 
 lint: install
 	poetry run isort .
