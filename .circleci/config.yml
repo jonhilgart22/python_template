@@ -1,0 +1,633 @@
+# https://github.com/onemedical/services_architecture/releases/tag/release-36
+version: 2.1
+
+orbs:
+  aws-cli: circleci/aws-cli@1.3.2
+  aws-ecr: circleci/aws-ecr@6.15.2
+  aws-ecs: circleci/aws-ecs@1.4.0
+  slack: circleci/slack@4.2.0
+
+executors:
+  machine-layer-caching:
+    machine:
+      docker_layer_caching: true
+  docker-python:
+    docker:
+      - image: circleci/python:3.6
+
+parameters:
+  service_name:
+    type: string
+    default: "ml-smoking-status"
+  environment_production:
+    type: string
+    default: "production"
+  environment_staging:
+    type: string
+    default: "staging"
+  environment_qual:
+    type: string
+    default: "qual"
+  deploy_status_is_release_cut:
+    type: string
+    default: "release_cut"
+  deploy_status_is_deploy_ready:
+    type: string
+    default: "deploy_ready"
+  deploy_status_is_deploy_started:
+    type: string
+    default: "deploy_started"
+  deploy_status_is_deploy_completed:
+    type: string
+    default: "deploy_completed"
+  working_dir:
+    type: string
+    default: "/tmp/workspace"
+  workspace_with_imports:
+    type: string
+    default: "ci/slack/"
+  imported_slack_mappings:
+    type: string
+    default: "/tmp/workspace/ci/slack/slack_mapping.json"
+  imported_app_urls_config:
+    type: string
+    default: "/tmp/workspace/ci/slack/app_urls.json"
+  account_id_main:
+    type: integer
+    default: 193567999519
+  account_id_staging:
+    type: integer
+    default: 433233631458
+  account_id_production:
+    type: integer
+    default: 791438786431
+
+references:
+  build_filters: &build_filters
+    filters:
+      branches:
+        ignore: /integration\/.*/
+  release_filters: &release_filters
+    context: circleci-notifier
+    filters:
+      tags:
+        only: /^release.*/
+      branches:
+        ignore: /^.*/
+  main_branch_filters: &main_branch_filters
+    filters:
+      branches:
+        only: main
+  integration_filters: &integration_filters
+    filters:
+      branches:
+        only: /integration\/.*/
+
+commands:
+  add_ecr_tag:
+    description: Add a new tag to an existing image in ECR
+    parameters:
+      repository_name:
+        type: string
+      current_tag:
+        type: string
+      new_tag:
+        type: string
+    steps:
+      - run:
+          name: "Add new tag to existing image"
+          command: |
+            aws ecr put-image \
+              --repository-name <<parameters.repository_name>> \
+              --image-tag <<parameters.new_tag>> \
+              --image-manifest "$(aws ecr batch-get-image \
+                                    --repository-name <<parameters.repository_name>> \
+                                    --image-ids imageTag=<<parameters.current_tag>> \
+                                    --query 'images[].imageManifest' \
+                                    --output text)"
+
+  assume_role:
+    description: Assumes an AWS role. Any AWS CLI call made after this will use the new role.
+    parameters:
+      aws_account_id:
+        type: integer
+      role_name:
+        type: string
+    steps:
+      - run:
+          name: Assume role
+          command: |
+            ./ci/bin/assume_role.sh <<parameters.aws_account_id>> <<parameters.role_name>>
+
+  broadcast_deploy_status:
+    description: "Broadcast deploy status in slack"
+    parameters:
+      environment:
+        type: string
+      status:
+        type: string
+      tag_prefix:
+        type: string
+        default: release-
+    steps:
+      - attach_workspace:
+          at: <<pipeline.parameters.working_dir>>
+      - run:
+          name: Export environment vars
+          command: |
+            echo 'export PROJECT_URL=<<pipeline.project.git_url>>' >> $BASH_ENV
+            echo 'export ENVIRONMENT=<<parameters.environment>>' >> $BASH_ENV
+            echo 'export DEPLOY_LINK="${CIRCLE_TAG:-$CIRCLE_BRANCH}"' >> $BASH_ENV
+            echo 'export CHANNELS=$(echo $ML_DEFAULT_RELEASE_SLACK_CHANNELS | base64 --decode | jq ".slack_channels[].id" | xargs)' >> $BASH_ENV
+
+            if [ <<parameters.status>> == <<pipeline.parameters.deploy_status_is_release_cut>> ]; then
+              echo 'export RELEASE_TAG="<<parameters.tag_prefix>>$(cat /tmp/workspace/ci/TAG)"' >> $BASH_ENV
+            fi
+
+            mapping=$(cat <<pipeline.parameters.imported_slack_mappings>>)
+            path_to_template=$(echo $mapping | jq '.slack_templates | map(select(.deploy_status | contains("<<parameters.status>>"))) | .[] .path_to_template' | xargs)
+            template_content=$(cat "/tmp/workspace/$path_to_template")
+            echo "export SLACK_TEMPLATE='${template_content}'" >> $BASH_ENV
+
+            app_urls_config=$(cat <<pipeline.parameters.imported_app_urls_config>>)
+            host=$(echo $app_urls_config | jq '.app_urls | map(select(.environment | contains("<<parameters.environment>>"))) | .[] .host' | xargs)
+            echo "export HOST='${host}'" >> $BASH_ENV
+      - slack/notify:
+          channel: $CHANNELS
+          template: SLACK_TEMPLATE
+          event: always
+
+  build_dependencies:
+    description: Build the poetry environment
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - deps-{{ .Environment.CACHE_VERSION }}-{{ checksum "poetry.lock" }}
+      - run:
+          name: Install python dependencies
+          command: |
+            curl -sSL https://raw.githubusercontent.com/python-poetry/poetry/master/get-poetry.py | python
+            source $HOME/.poetry/env
+            poetry run pip install --upgrade pip
+            poetry install --no-root
+      - save_cache:
+          key: deps-{{ .Environment.CACHE_VERSION }}-{{ checksum "poetry.lock" }}
+          paths:
+            - ~/.cache/pypoetry/virtualenvs
+
+  create_image_tag:
+    description: Create image tag based on the current branch
+    steps:
+      - run:
+          name: Create IMAGE_TAG env var based on the current branch
+          command: |
+            if [[ -n "${CIRCLE_TAG:-}" ]]; then
+              image_tag=${CIRCLE_TAG}
+            elif [[ $CIRCLE_BRANCH = "main" || $CIRCLE_BRANCH = "staging" ]]; then
+              image_tag=${CIRCLE_BRANCH}-${CIRCLE_SHA1}
+            else
+              image_tag=branch-$(echo $CIRCLE_BRANCH | tr / -)
+            fi
+            echo "export IMAGE_TAG='${image_tag}'" >> $BASH_ENV
+
+  deploy_ecs:
+    description: "Deploy ECS service"
+    parameters:
+      aws_account_id:
+        type: integer
+      cluster_name:
+        type: string
+      environment:
+        type: string
+      host:
+        type: string
+      notify:
+        type: boolean
+      tag_prefix:
+        type: string
+        default: release-
+    steps:
+      - aws-cli/install
+      - when:
+          condition:
+            and:
+              - equal: [true, <<parameters.notify>>]
+          steps:
+            - broadcast_deploy_status:
+                status: <<pipeline.parameters.deploy_status_is_deploy_started>>
+                environment: "<<parameters.environment>>"
+                tag_prefix: <<parameters.tag_prefix>>
+      - assume_role:
+          aws_account_id: <<parameters.aws_account_id>>
+          role_name: deployer-<<pipeline.parameters.service_name>>
+      - aws-ecs/update-service:
+          cluster-name: "<<parameters.cluster_name>>"
+          service-name: "<<pipeline.parameters.service_name>>"
+          family: "<<pipeline.parameters.service_name>>-<<parameters.cluster_name>>"
+          container-image-name-updates: "container=<<pipeline.parameters.service_name>>,tag=${CIRCLE_TAG:-branch-$(echo $CIRCLE_BRANCH | tr / -)}"
+          force-new-deployment: true
+          verify-revision-is-deployed: true
+      - when:
+          condition:
+            and:
+              - equal: [true, <<parameters.notify>>]
+          steps:
+            - broadcast_deploy_status:
+                status: <<pipeline.parameters.deploy_status_is_deploy_completed>>
+                environment: "<<parameters.environment>>"
+                tag_prefix: <<parameters.tag_prefix>>
+
+  record_deploy_in_rollbar:
+    description: Record deploy is finished in Rollbar
+    parameters:
+      environment:
+        type: string
+    steps:
+      - run:
+          name: Record deployment in Rollbar
+          command: |
+            ./ci/bin/record_rollbar_deploy.sh <<parameters.environment>> <<pipeline.parameters.service_name>> $CIRCLE_SHA1
+
+jobs:
+  semgrep-scan:
+    parameters:
+      repo_path:
+        type: string
+        default: onemedical/ml-smoking-status
+      default_branch:
+        type: string
+        default: main
+    environment:
+      SEMGREP_REPO_NAME: << parameters.repo_path >>
+      SEMGREP_REPO_URL: << pipeline.project.git_url >>
+      SEMGREP_BRANCH: << pipeline.git.branch >>
+    docker:
+      - image: returntocorp/semgrep-agent:v1
+    steps:
+      - checkout
+      - run:
+          name: "Semgrep scan"
+          command: |
+            python -m semgrep_agent \
+              --publish-deployment $SEMGREP_DEPLOYMENT_ID \
+              --publish-token $SEMGREP_APP_TOKEN \
+              --baseline-ref << parameters.default_branch >>
+  build_image:
+    executor:
+      name: machine-layer-caching
+    steps:
+      - checkout
+      - aws-cli/install
+      - create_image_tag
+      - aws-ecr/build-and-push-image:
+          account-url: AWS_ECR_ACCOUNT_URL
+          dockerfile: Dockerfile.inference
+          repo: <<pipeline.parameters.service_name>>
+          tag: ${IMAGE_TAG}
+
+  cut_release:
+    executor:
+      name: docker-python
+    parameters:
+      tag_prefix:
+        type: string
+        default: release-
+    steps:
+      - add_ssh_keys:
+          fingerprints:
+            - "9f:50:49:76:97:1a:21:3a:3c:3d:50:f4:d7:f9:77:18"
+      - checkout
+      - attach_workspace:
+          at: .
+      - run:
+          name: Pull latest
+          command: |
+            git pull origin ${CIRCLE_BRANCH} && git checkout ${CIRCLE_BRANCH}
+      - run:
+          name: Tag release
+          command: |
+            ./ci/bin/tag.sh ci <<parameters.tag_prefix>>
+
+  deploy_qual:
+    parameters:
+      cluster_name:
+        type: string
+    executor:
+      name: docker-python
+    steps:
+      - checkout
+      - deploy_ecs:
+          aws_account_id: <<pipeline.parameters.account_id_main>>
+          cluster_name: <<parameters.cluster_name>>
+          environment: <<pipeline.parameters.environment_qual>>
+          host: "<<parameters.cluster_name>>-<<pipeline.parameters.service_name>>.app.1life.com"
+          notify: false
+
+  deploy_main:
+    executor:
+      name: docker-python
+    steps:
+      - checkout
+      - deploy_ecs:
+          aws_account_id: <<pipeline.parameters.account_id_main>>
+          cluster_name: "prime"
+          environment: <<pipeline.parameters.environment_qual>>
+          host: "prime-<<pipeline.parameters.service_name>>.app.1life.com"
+          notify: true
+
+  deploy_staging:
+    executor:
+      name: docker-python
+    steps:
+      - checkout
+      - deploy_ecs:
+          aws_account_id: <<pipeline.parameters.account_id_staging>>
+          cluster_name: "qa"
+          environment: "staging"
+          host: "<<pipeline.parameters.service_name>>.stage.1life.com"
+          notify: true
+
+  deploy_production:
+    executor:
+      name: docker-python
+    steps:
+      - checkout
+      - deploy_ecs:
+          aws_account_id: <<pipeline.parameters.account_id_production>>
+          cluster_name: "production"
+          environment: "production"
+          host: "<<pipeline.parameters.service_name>>.prod.1life.com"
+          notify: true
+
+  generate_next_release_tag:
+    executor:
+      name: docker-python
+    parameters:
+      tag_prefix:
+        type: string
+        default: release-
+    steps:
+      - checkout
+      - run:
+          name: Get next release tag
+          command: |
+            ./ci/bin/next_tag.sh ci <<parameters.tag_prefix>>
+      - persist_to_workspace:
+          root: .
+          paths:
+            - ci/<<parameters.tag_prefix>>TAG
+
+  import_slack_templates:
+    description: "Import project specific slack notification templates into CircleCI workspace"
+    executor:
+      name: docker-python
+    working_directory: <<pipeline.parameters.working_dir>>
+    steps:
+      - checkout
+      - persist_to_workspace:
+          root: .
+          paths:
+            - <<pipeline.parameters.workspace_with_imports>>
+
+  notify_staging_deploy_ready:
+    executor:
+      name: machine-layer-caching
+    steps:
+      - broadcast_deploy_status:
+          status: <<pipeline.parameters.deploy_status_is_deploy_ready>>
+          environment: <<pipeline.parameters.environment_staging>>
+
+  notify_production_deploy_ready:
+    executor:
+      name: machine-layer-caching
+    steps:
+      - broadcast_deploy_status:
+          status: <<pipeline.parameters.deploy_status_is_deploy_ready>>
+          environment: <<pipeline.parameters.environment_production>>
+
+  notify_release_cut_awaiting_approval:
+    executor:
+      name: machine-layer-caching
+    steps:
+      - broadcast_deploy_status:
+          status: <<pipeline.parameters.deploy_status_is_release_cut>>
+          environment: "n/a"
+
+  record_staging_deploy:
+    executor:
+      name: docker-python
+    steps:
+      - checkout
+      - aws-cli/install
+      - assume_role:
+          aws_account_id: <<pipeline.parameters.account_id_staging>>
+          role_name: deployer-<<pipeline.parameters.service_name>>
+      - record_deploy_in_rollbar:
+          environment: "staging"
+
+  record_production_deploy:
+    executor:
+      name: docker-python
+    steps:
+      - checkout
+      - aws-cli/install
+      - assume_role:
+          aws_account_id: <<pipeline.parameters.account_id_production>>
+          role_name: deployer-<<pipeline.parameters.service_name>>
+      - record_deploy_in_rollbar:
+          environment: "production"
+
+  tag_release_image:
+    executor:
+      name: docker-python
+    parameters:
+      tag_prefix:
+        type: string
+        default: release-
+      repository_name:
+        type: string
+        default: <<pipeline.parameters.service_name>>
+    steps:
+      - attach_workspace:
+          at: .
+      - aws-cli/install
+      - run:
+          name: Wait for image build
+          command: |
+            set +e
+            REPO_NAME=<<parameters.repository_name>>
+            TESTED_TAG="tested-${CIRCLE_SHA1}"
+            TOTAL_WAIT_SECONDS=3600
+            POLL_TIME_SECONDS=20
+            waited_so_far=0
+
+            while [ $waited_so_far -lt $TOTAL_WAIT_SECONDS ]
+
+            do
+                aws ecr describe-images --repository-name ${REPO_NAME} --image-ids imageTag="${TESTED_TAG}" >/dev/null 2>&1
+                exit_code=$?
+                if [ $exit_code -eq 0 ] ; then
+                    echo "${TESTED_TAG} image found after ${waited_so_far} seconds"
+                    exit 0
+                fi
+                echo "${TESTED_TAG} image not present in ECR... $waited_so_far of $TOTAL_WAIT_SECONDS seconds waited"
+                sleep $POLL_TIME_SECONDS
+                waited_so_far=$[$waited_so_far+$POLL_TIME_SECONDS]
+            done
+
+            echo "$TESTED_TAG image not found after $waited_so_far seconds"
+
+            exit 1
+      - add_ecr_tag:
+          repository_name: <<parameters.repository_name>>
+          current_tag: tested-${CIRCLE_SHA1}
+          new_tag: <<parameters.tag_prefix>>$(cat ci/<<parameters.tag_prefix>>TAG)
+
+  test:
+    executor:
+      name: docker-python
+    steps:
+      - build_dependencies
+      - run:
+          name: Lint - black
+          command: |
+            poetry run black --check ml_smoking_status tests
+      - run:
+          name: Lint - isort
+          command: |
+            poetry run isort ml_smoking_status tests --check
+      - run:
+          name: Lint - mypy
+          command: |
+            poetry run mypy ml_smoking_status tests
+      - run:
+          name: Lint - flake8
+          command: |
+            poetry run flake8 ml_smoking_status tests
+      - run:
+          name: Setup - Code Climate
+          command: |
+            curl -L https://codeclimate.com/downloads/test-reporter/test-reporter-latest-linux-amd64 > ./cc-test-reporter
+            chmod +x ./cc-test-reporter
+      - run:
+          name: Test - pytest
+          command: |
+            ./cc-test-reporter before-build
+            poetry run python -m pytest . --cov=. --cov-report xml
+            ./cc-test-reporter after-build  -r $CODE_CLIMATE_ID --coverage-input-type coverage.py  --exit-code $?
+
+  validate_image:
+    executor:
+      name: docker-python
+    description: Tag the ECS image as tested
+    steps:
+      - aws-cli/install
+      - add_ecr_tag:
+          repository_name: <<pipeline.parameters.service_name>>
+          current_tag: ${CIRCLE_BRANCH}-${CIRCLE_SHA1}
+          new_tag: tested-${CIRCLE_SHA1}
+
+workflows:
+  build:
+    jobs:
+      - semgrep-scan:
+          context:
+            - semgrep-static-analysis
+      - test:
+          <<: *build_filters
+      - build_image:
+          <<: *build_filters
+          requires:
+            - test
+      - validate_image:
+          <<: *main_branch_filters
+          requires:
+            - build_image
+
+  integration:
+    jobs:
+      - test:
+          <<: *integration_filters
+      - build_image:
+          <<: *integration_filters
+          requires:
+            - test
+      - deploy_qual:
+          <<: *integration_filters
+          cluster_name: $([[ $CIRCLE_BRANCH =~ ^integration\/.* ]] && echo $CIRCLE_BRANCH | sed -e "s/^integration\///" || echo 'test')
+          requires:
+            - build_image
+
+  release_cut:
+    jobs:
+      - import_slack_templates:
+          <<: *main_branch_filters
+      - generate_next_release_tag:
+          <<: *main_branch_filters
+      - notify_release_cut_awaiting_approval:
+          <<: *main_branch_filters
+          context: circleci-notifier
+          requires:
+            - import_slack_templates
+            - generate_next_release_tag
+      - approve_release_cut:
+          <<: *main_branch_filters
+          type: approval
+          requires:
+            - notify_release_cut_awaiting_approval
+      - tag_release_image:
+          <<: *main_branch_filters
+          requires:
+            - approve_release_cut
+      - cut_release:
+          <<: *main_branch_filters
+          requires:
+            - tag_release_image
+
+  release:
+    jobs:
+      - import_slack_templates:
+          <<: *release_filters
+      - deploy_main:
+          <<: *release_filters
+          requires:
+            - import_slack_templates
+      - notify_staging_deploy_ready:
+          <<: *release_filters
+          requires:
+            - deploy_main
+            - import_slack_templates
+      - approve_staging_deploy:
+          <<: *release_filters
+          type: approval
+          requires:
+            - notify_staging_deploy_ready
+      - deploy_staging:
+          <<: *release_filters
+          requires:
+            - approve_staging_deploy
+            - import_slack_templates
+      - record_staging_deploy:
+          <<: *release_filters
+          requires:
+            - deploy_staging
+      - notify_production_deploy_ready:
+          <<: *release_filters
+          requires:
+            - deploy_staging
+            - import_slack_templates
+      - approve_production_deploy:
+          <<: *release_filters
+          type: approval
+          requires:
+            - notify_production_deploy_ready
+      - deploy_production:
+          <<: *release_filters
+          requires:
+            - approve_production_deploy
+            - import_slack_templates
+      - record_production_deploy:
+          <<: *release_filters
+          requires:
+            - deploy_production
